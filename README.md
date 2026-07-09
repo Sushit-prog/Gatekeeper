@@ -5,23 +5,25 @@ Deterministic policy enforcement gate for LLM tool calls. Validates tool-call re
 ## Architecture
 
 ```
-Client (test harness / future agent)
+Client (test harness / agent)
    │  POST /gate/check
    ▼
-┌─────────────────────────────────┐
-│   FastAPI Gate Service          │
-│  ┌───────────┐  ┌───────────┐  │
-│  │   Rule    │  │   Gate    │  │
-│  │  Engine   │─▶│  Decision │  │
-│  └───────────┘  └─────┬─────┘  │
-│                       │        │
-│  ┌────────────────────▼─────┐  │
-│  │     Audit Logger         │  │
-│  └────────────────────┬─────┘  │
-└───────────────────────┼────────┘
-                        ▼
-                   PostgreSQL
-                   (audit_log)
+┌──────────────────────────────────────┐
+│   FastAPI Gate Service               │
+│  ┌─────────────┐  ┌──────────────┐  │
+│  │ Rule Engine │  │  Gate        │  │
+│  │ (stateless  │─▶│  Decision    │  │
+│  │  + stateful)│  └──────┬───────┘  │
+│  └──────┬──────┘         │          │
+│         │ reads          │          │
+│  ┌──────▼──────┐  ┌──────▼───────┐  │
+│  │session_state│  │ Audit Logger │  │
+│  │  (indexed)  │  └──────┬───────┘  │
+│  └─────────────┘         │          │
+└──────────────────────────┼──────────┘
+                           ▼
+                      PostgreSQL
+                  (audit_log + session_state)
 ```
 
 ## Quick Start
@@ -123,6 +125,78 @@ All applicable rules are evaluated for every request, even if an earlier rule al
 
 Rules can have severity `"warn"` or `"block"`. Warn-severity failures are logged but do not cause a BLOCK decision. This enables flagging suspicious-but-allowed behavior for future review without disrupting the workflow.
 
+## Stateful Rules (M2)
+
+GateKeeper extends beyond per-request evaluation with **stateful cross-call constraint checking**. This catches failures that only emerge across a sequence of calls within a session.
+
+### Session State vs Audit Log
+
+| Table | Purpose | Mutability | Query Pattern |
+|-------|---------|------------|---------------|
+| `audit_log` | Append-only compliance record | Write-once | By time range, session, tool |
+| `session_state` | Indexed lookups for stateful rules | TTL-pruned | By `(session_id, tool_name, created_at)` |
+
+The split is deliberate: `audit_log` is the immutable compliance record; `session_state` is a purpose-built index for fast cross-call queries. They're written in the same transaction so they can't diverge, but they serve different needs.
+
+### Built-in Stateful Rules
+
+**RateLimitRule** — blocks if more than N calls to a tool occur within a time window per session. Configured per-tool in `policy_registry.yaml`:
+```yaml
+rate_limit:
+  max_calls: 3
+  window_seconds: 300
+```
+
+**ScopeCreepRule** — the core failure mode this project exists to catch. Blocks if a tool call references an entity that was explicitly marked as protected in an earlier call within the same session. The agent's reasoning for why it should be allowed is never evaluated — only the protection tag matters.
+
+### Protection Tagging
+
+Tools can "tag" entities as protected via the `tag_tools` config:
+```yaml
+check_permissions:
+  tag_tools:
+    protected_field: "record_id"
+    protected_tag: "protected_record_ids"
+```
+
+When `check_permissions(record_id=X)` is ALLOW'd, the engine automatically writes a session_state record with `tags: {"protected_record_ids": ["X"]}`. ScopeCreepRule then blocks any subsequent call referencing X.
+
+### Session State Pruning
+
+Session state records are automatically pruned. Run manually or via cron:
+```bash
+# Prune records older than 24h (default)
+uv run python scripts/prune_session_state.py
+
+# Custom TTL
+SESSION_STATE_TTL_HOURS=12 uv run python scripts/prune_session_state.py
+```
+
+## Agent Demo
+
+The `agent_demo/` module demonstrates GateKeeper with a LangGraph agent. It requires optional dependencies:
+```bash
+uv sync --extra agent
+```
+
+### Scope Creep Demo
+
+Run the standalone scope-creep demonstration:
+```bash
+# Start the service first
+docker-compose up -d
+uv run uvicorn src.gatekeeper.main:app
+
+# In another terminal, run the demo
+uv run python -m agent_demo.scenarios.scope_creep_demo
+```
+
+This reproduces the exact failure mode:
+1. Agent calls `check_permissions(record_id=X)` → ALLOW (X tagged as protected)
+2. Agent calls `delete_record(record_id=X)` with reasoning "deletion is a special case" → BLOCKED
+
+The output clearly shows the before/after with and without GateKeeper.
+
 ## Testing
 
 ```bash
@@ -130,8 +204,11 @@ uv run pytest -v
 ```
 
 Key test categories:
-- **Rule isolation tests**: each built-in rule tested independently
-- **Engine integration tests**: multiple rules on one tool, mixed severities
+- **Rule isolation tests**: each built-in rule tested independently (stateless + stateful)
+- **Engine integration tests**: multiple rules on one tool, mixed severities, stateful flow
 - **API integration tests**: full request → response → audit log verification
+- **Scope creep integration test**: check_permissions → delete_record → BLOCK via API
+- **Rate limit integration test**: N calls within window → BLOCK on N+1
+- **Transactional consistency**: both tables written per check, matching row counts
 - **Adversarial test**: identical args with different agent_reasoning produces identical decisions
-- **Latency test**: rule evaluation completes in <50ms
+- **Latency tests**: stateless <50ms, stateful <100ms

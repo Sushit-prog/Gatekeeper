@@ -17,8 +17,22 @@ tools:
 
   delete_record:
     rules: [argument_bounds]
+    stateful_rules: [rate_limit, scope_creep]
     argument_bounds:
       record_id: {type: str, pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+    rate_limit:
+      max_calls: 3
+      window_seconds: 300
+    scope_creep:
+      protected_field: "record_id"
+      protected_tag: "protected_record_ids"
+
+  check_permissions:
+    rules: []
+    stateful_rules: []
+    tag_tools:
+      protected_field: "record_id"
+      protected_tag: "protected_record_ids"
 
   file_write:
     rules: [denylist, argument_bounds]

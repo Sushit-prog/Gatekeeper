@@ -25,3 +25,4 @@ class GateDecision(BaseModel):
     matched_rules: list[RuleResult]
     latency_ms: float
     audit_id: str
+    tags: dict[str, Any] | None = None

@@ -4,6 +4,13 @@ from gatekeeper.models.requests import RuleResult
 from gatekeeper.rules.base import SessionStateRecord, StatefulRule
 
 
+def _ensure_aware(dt: datetime) -> datetime:
+    """Ensure a datetime is timezone-aware (UTC). Handles naive datetimes from SQLite."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
+
+
 class RateLimitRule(StatefulRule):
     """Blocks if more than N calls to a tool occur within a time window for a session."""
 
@@ -31,7 +38,7 @@ class RateLimitRule(StatefulRule):
             1 for record in session_history
             if record.tool_name == tool_name
             and record.decision == "ALLOW"
-            and record.created_at >= cutoff
+            and _ensure_aware(record.created_at) >= cutoff
         )
 
         if allowed_calls >= self._max_calls:

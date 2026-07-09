@@ -6,7 +6,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekeeper.audit.db import get_session
-from gatekeeper.audit.logger import log_decision
+from gatekeeper.audit.logger import log_decision, log_session_state
 from gatekeeper.engine import evaluate_gate
 from gatekeeper.models.audit import AuditLog
 from gatekeeper.models.requests import GateCheckRequest, GateDecision
@@ -31,7 +31,7 @@ async def gate_check(
 ) -> GateDecision:
     """Validate a tool call against policy rules and log the decision."""
     try:
-        decision = evaluate_gate(request, _registry)
+        decision = await evaluate_gate(request, _registry, session)
     except Exception as e:
         logger.error("rule_evaluation_error", error=str(e))
         return GateDecision(
@@ -41,7 +41,11 @@ async def gate_check(
             audit_id="",
         )
 
+    # Write both audit_log and session_state in the same transaction
     audit_id = await log_decision(session, request, decision)
+    await log_session_state(session, request, decision, tags=decision.tags)
+    await session.commit()
+
     decision.audit_id = audit_id
 
     logger.info(
