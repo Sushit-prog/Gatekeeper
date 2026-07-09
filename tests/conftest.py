@@ -6,7 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from gatekeeper.api.routes import set_registry
+from gatekeeper.api.routes import set_engine, set_registry
 from gatekeeper.audit.db import get_session
 from gatekeeper.models.audit import Base
 from gatekeeper.rules.registry import RuleRegistry
@@ -47,6 +47,8 @@ async def client(test_engine, test_session):
     app.dependency_overrides[get_session] = override_get_session
     registry = RuleRegistry("policies/policy_registry.yaml")
     set_registry(registry)
+    from gatekeeper.rules.pydantic_engine import PydanticRuleEngine
+    set_engine(PydanticRuleEngine(registry))
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:

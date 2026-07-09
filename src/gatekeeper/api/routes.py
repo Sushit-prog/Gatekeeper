@@ -5,18 +5,24 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from gatekeeper.audit.db import get_session
+from gatekeeper.audit.db import fetch_session_history_all_tools, get_session
 from gatekeeper.audit.logger import log_decision, log_session_state
-from gatekeeper.engine import evaluate_gate
 from gatekeeper.models.audit import AuditLog
 from gatekeeper.models.requests import GateCheckRequest, GateDecision
+from gatekeeper.rules.engine import RuleEngine
 from gatekeeper.rules.registry import RuleRegistry
 
 logger = structlog.get_logger()
 
 router = APIRouter()
 
+_engine: RuleEngine | None = None
 _registry: RuleRegistry | None = None
+
+
+def set_engine(engine: RuleEngine) -> None:
+    global _engine
+    _engine = engine
 
 
 def set_registry(registry: RuleRegistry) -> None:
@@ -31,7 +37,13 @@ async def gate_check(
 ) -> GateDecision:
     """Validate a tool call against policy rules and log the decision."""
     try:
-        decision = await evaluate_gate(request, _registry, session)
+        # Fetch session history for stateful rules
+        session_history = await fetch_session_history_all_tools(
+            session, request.session_id
+        )
+        decision = await _engine.evaluate(
+            request.tool_name, request.args, session_history
+        )
     except Exception as e:
         logger.error("rule_evaluation_error", error=str(e))
         return GateDecision(

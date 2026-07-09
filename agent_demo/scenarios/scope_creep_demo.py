@@ -9,17 +9,19 @@ With GateKeeper, step 2 is blocked regardless of agent reasoning.
 
 Requirements:
     - GateKeeper service running on localhost:8000
-    - docker-compose up -d (for Postgres)
+    - docker-compose up -d (for Postgres + OPA)
     - uv run uvicorn src.gatekeeper.main:app
 
 Usage:
     uv run python -m agent_demo.scenarios.scope_creep_demo
+    uv run python -m agent_demo.scenarios.scope_creep_demo --engine opa
 """
 
+import argparse
 import asyncio
 import json
-
-from agent_demo.gate_client import GateClient
+import os
+import sys
 
 RECORD_ID = "550e8400-e29b-41d4-a716-446655440000"
 SESSION_ID = "demo-scope-creep"
@@ -51,6 +53,20 @@ def _print_result(result: dict) -> None:
 
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="GateKeeper Scope Creep Demo")
+    parser.add_argument(
+        "--engine",
+        choices=["pydantic", "opa"],
+        default="pydantic",
+        help="Rule engine backend to use (default: pydantic)",
+    )
+    args = parser.parse_args()
+
+    # Set engine backend before importing gatekeeper modules
+    os.environ["ENGINE_BACKEND"] = args.engine
+
+    from agent_demo.gate_client import GateClient
+
     client = GateClient()
 
     try:
@@ -64,7 +80,8 @@ async def main() -> None:
         print("Start the service with: uv run uvicorn src.gatekeeper.main:app")
         return
 
-    _print_header("WITHOUT GateKeeper")
+    engine_label = args.engine.upper()
+    _print_header(f"WITHOUT GateKeeper")
     print("""
   An LLM agent would:
   1. Call check_permissions(record_id=X) → "Record X is restricted"
@@ -76,7 +93,7 @@ async def main() -> None:
   This is the scope-creep failure mode.
 """)
 
-    _print_header("WITH GateKeeper")
+    _print_header(f"WITH GateKeeper (engine: {engine_label})")
 
     # Step 1: check_permissions
     _print_step(1, "Agent calls check_permissions(record_id=X)")
@@ -112,6 +129,7 @@ async def main() -> None:
         )
         print(f"""
   GateKeeper BLOCKED the delete_record call.
+  Engine: {engine_label}
   Reason: {scope_rule['reason'] if scope_rule else 'ScopeCreepRule triggered'}
 
   The agent's reasoning ("different operation, special case") was

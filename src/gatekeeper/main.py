@@ -8,9 +8,11 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from gatekeeper.api.routes import router, set_registry
+from gatekeeper.api.routes import router, set_engine, set_registry
 from gatekeeper.audit.db import init_db
 from gatekeeper.config import settings
+from gatekeeper.rules.engine import RuleEngine
+from gatekeeper.rules.pydantic_engine import PydanticRuleEngine
 from gatekeeper.rules.registry import RuleRegistry
 
 
@@ -26,16 +28,27 @@ def configure_logging() -> None:
     )
 
 
+def _create_engine(registry: RuleRegistry) -> RuleEngine:
+    """Create the appropriate rule engine based on ENGINE_BACKEND setting."""
+    backend = settings.engine_backend.lower()
+    if backend == "opa":
+        from gatekeeper.rules.opa_engine import OPARuleEngine
+        return OPARuleEngine(opa_url=settings.opa_url)
+    return PydanticRuleEngine(registry)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging()
     await init_db()
     registry = RuleRegistry(settings.policy_path)
     set_registry(registry)
+    engine = _create_engine(registry)
+    set_engine(engine)
     yield
 
 
-app = FastAPI(title="GateKeeper", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="GateKeeper", version="0.2.0", lifespan=lifespan)
 app.include_router(router)
 
 

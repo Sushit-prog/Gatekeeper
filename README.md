@@ -187,8 +187,11 @@ Run the standalone scope-creep demonstration:
 docker-compose up -d
 uv run uvicorn src.gatekeeper.main:app
 
-# In another terminal, run the demo
+# In another terminal, run the demo with Pydantic engine (default)
 uv run python -m agent_demo.scenarios.scope_creep_demo
+
+# Or run with OPA engine (requires OPA sidecar)
+uv run python -m agent_demo.scenarios.scope_creep_demo --engine opa
 ```
 
 This reproduces the exact failure mode:
@@ -196,6 +199,101 @@ This reproduces the exact failure mode:
 2. Agent calls `delete_record(record_id=X)` with reasoning "deletion is a special case" → BLOCKED
 
 The output clearly shows the before/after with and without GateKeeper.
+
+## Rule Engines (M3)
+
+GateKeeper supports two swappable rule engine backends via the `ENGINE_BACKEND` environment variable:
+
+| Engine | Default | Description |
+|--------|---------|-------------|
+| `pydantic` | Yes | Python-native rules using Pydantic validation. Good for development and single-developer projects. |
+| `opa` | No | OPA/Rego sidecar. Declarative policies, versionable independently, testable with OPA's own framework. Industry standard for multi-team policy management. |
+
+### Why OPA?
+
+Pydantic rules conflate policy logic with application code — every policy change requires a code change and redeploy. OPA/Rego separates policy from code:
+
+- **Declarative**: Policies are data, not code. Easier to review, audit, and reason about.
+- **Independent versioning**: Policy files can be versioned and deployed separately from the service.
+- **Built-in testing**: OPA has its own test framework (`opa test`) for policy-level validation.
+- **Industry standard**: Used by Netflix, Pinterest, Chef, and others for exactly this use case.
+
+### Switching Engines
+
+```bash
+# Use Pydantic engine (default)
+ENGINE_BACKEND=pydantic uv run uvicorn src.gatekeeper.main:app
+
+# Use OPA engine (requires OPA sidecar)
+docker-compose up -d opa
+ENGINE_BACKEND=opa uv run uvicorn src.gatekeeper.main:app
+```
+
+### OPA Architecture
+
+```
+FastAPI Gate Service
+    │
+    ├─ RuleEngine interface (strategy pattern)
+    │    ├─ PydanticRuleEngine   (M1/M2, unchanged)
+    │    └─ OPARuleEngine        (queries OPA over HTTP)
+    │
+    └─ ENGINE_BACKEND env var selects implementation
+
+OPA Server (Docker sidecar)
+    │  POST /v1/data/gatekeeper/decision
+    │  Input: { tool_name, args, session_history }
+    │  Output: { decision, matched_rules }
+    └  Policies loaded from ./policies/rego/
+```
+
+Session history is fetched in Python and passed to OPA as input — OPA does not talk to Postgres directly.
+
+### Fail-BLOCK on OPA Unreachable
+
+If the OPA server is unreachable, `OPARuleEngine` returns **BLOCK**. This is an infrastructure failure, distinct from the M1 default-ALLOW for unknown tools:
+
+- **Unknown tool → ALLOW**: Policy is opt-in. No rule configured means no restriction.
+- **OPA unreachable → BLOCK**: Policy engine is down. Cannot verify compliance. Fail closed.
+
+This distinction is deliberate: an unreachable policy engine is a system failure that must be detected and resolved, not silently bypassed.
+
+### Rego Policies
+
+Policies live in `policies/rego/`:
+
+```
+policies/rego/
+├── data.json                  # Policy config (bounds, denylists, rate limits)
+├── decision.rego              # Top-level decision combiner
+├── pii_detection.rego         # PII regex matching
+├── argument_bounds.rego       # Type/pattern/range validation
+├── denylist.rego              # Value denylist checks
+├── rate_limit.rego            # Cross-call rate limiting
+├── scope_creep.rego           # Protected entity tracking
+└── *_test.rego                # OPA-native tests
+```
+
+Run OPA tests:
+```bash
+docker-compose up -d opa
+docker compose exec opa opa test /policies -v
+```
+
+### Parity Testing
+
+The parity test suite (`tests/test_parity.py`) runs the same test cases against both engines and asserts identical decisions:
+
+```bash
+# Pydantic parity tests (always run)
+uv run pytest tests/test_parity.py::TestParity -v
+
+# OPA parity tests (require OPA server)
+docker-compose up -d opa
+uv run pytest tests/test_parity.py::TestOPAParity -v
+```
+
+Both engines are proven equivalent on the full test suite, including the scope-creep scenario. Any behavioral mismatch is surfaced as a test failure, not hidden.
 
 ## Testing
 
@@ -212,3 +310,5 @@ Key test categories:
 - **Transactional consistency**: both tables written per check, matching row counts
 - **Adversarial test**: identical args with different agent_reasoning produces identical decisions
 - **Latency tests**: stateless <50ms, stateful <100ms
+- **Parity tests**: both engines produce identical decisions on shared test cases
+- **OPA tests**: Rego policies validated with OPA's built-in test framework
