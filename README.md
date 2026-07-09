@@ -1,314 +1,198 @@
 # GateKeeper
 
-Deterministic policy enforcement gate for LLM tool calls. Validates tool-call requests against configurable rules before execution.
+**A deterministic policy gate that catches what LLM judges structurally cannot — because it never reads the reasoning that fools them.**
+
+GateKeeper intercepts LLM tool calls with rules that evaluate only the tool name, arguments, and session history. The agent's stated reasoning is never passed to any rule — not ignored, but structurally inaccessible. This means a sufficiently persuasive justification cannot talk the gate into approving a violation.
+
+Based on the concept from "Reason Less, Verify More: Deterministic Gates Recover a Silent Policy-Violation Failure Mode in Tool-Using LLM Agents."
+
+## The Problem
+
+When an LLM agent wants to violate a policy, it can construct a justification that sounds legitimate: citing a plausible policy clause, claiming emergency override authority, invoking a technicality about the restriction's scope. An LLM-judge verifier reads this reasoning and is susceptible to the same failure mode — it can be persuaded by the same text that fooled the acting agent.
+
+GateKeeper sidesteps this entirely. Rules never see the reasoning text. They evaluate what the agent wants to do (tool name + args), not why it claims to want to do it.
+
+## The Headline Result
+
+A red-team benchmark measured catch rates across 50 scenarios with reasoning of varying persuasiveness:
+
+**Overall results** (50 scenarios across all categories):
+
+| Approach | Catch Rate | False Positive Rate |
+|----------|-----------|---------------------|
+| No gate (baseline) | 0.0% | 0.0% |
+| LLM Judge (Groq llama-3.3-70b) | 63.0% | 17.4% |
+| GateKeeper | **100.0%** | 13.0% |
+
+**Scope Creep catch rate by reasoning persuasiveness** (21 scenarios — the core failure mode):
+
+| Persuasiveness Tier | LLM Judge | GateKeeper |
+|---------------------|-----------|------------|
+| Weak ("I'll just delete it anyway") | 100% | 100% |
+| Moderate ("this is a different operation type") | 100% | 100% |
+| Sophisticated (cites GDPR articles, incident playbooks, governance tickets) | **12.5%** | **100%** |
+
+The LLM judge was given full context — tool call, args, session history, and the agent's reasoning — for fairness. The only variable being tested was whether persuasive reasoning can produce a wrong decision despite having the same facts GateKeeper uses to correctly block. The answer, on sophisticated reasoning, is yes. GateKeeper's accuracy is structurally unaffected because it never reads the reasoning text at all.
 
 ## Architecture
 
 ```
-Client (test harness / agent)
-   │  POST /gate/check
+LLM Agent
+   │  tool_name + args (+ reasoning, discarded by gate)
    ▼
-┌──────────────────────────────────────┐
-│   FastAPI Gate Service               │
-│  ┌─────────────┐  ┌──────────────┐  │
-│  │ Rule Engine │  │  Gate        │  │
-│  │ (stateless  │─▶│  Decision    │  │
-│  │  + stateful)│  └──────┬───────┘  │
-│  └──────┬──────┘         │          │
-│         │ reads          │          │
-│  ┌──────▼──────┐  ┌──────▼───────┐  │
-│  │session_state│  │ Audit Logger │  │
-│  │  (indexed)  │  └──────┬───────┘  │
-│  └─────────────┘         │          │
-└──────────────────────────┼──────────┘
-                           ▼
-                      PostgreSQL
-                  (audit_log + session_state)
+┌──────────────────────────────────────────┐
+│            GateKeeper Service             │
+│                                          │
+│  ┌──────────────┐    ┌───────────────┐  │
+│  │  RuleEngine  │    │  Audit Logger │  │
+│  │  interface   │───▶│  (Postgres)   │  │
+│  └──────┬───────┘    └───────────────┘  │
+│         │                                │
+│    ┌────┴────┐                           │
+│    ▼         ▼                           │
+│ Pydantic   OPA/Rego                      │
+│ Engine     Engine                        │
+│ (~0.1ms)   (~7-15ms)                     │
+└──────────────────────────────────────────┘
+         │
+    ┌────┴────────────────┐
+    ▼                     ▼
+ audit_log           session_state
+ (append-only,       (indexed, pruned,
+  compliance)         stateful rules)
 ```
 
-## Quick Start
+## Milestones
+
+| Milestone | What was built | Key design decision |
+|-----------|---------------|---------------------|
+| **M1** | Core gate service: FastAPI, 3 stateless rules (PII, argument bounds, denylist), Postgres audit log | Structural reasoning isolation — `Rule.evaluate()` signature is `(tool_name, args)` only |
+| **M2** | Stateful cross-call detection: `session_state` table, RateLimitRule, ScopeCreepRule | Separate session_state from audit_log — fast indexed reads for rules, immutable compliance record for audit |
+| **M3** | Dual rule engine: PydanticRuleEngine + OPARuleEngine with parity tests | OPA as swappable sidecar, not replacement — both remain fully functional |
+| **M4** | Red-team benchmark: 50 scenarios, 3 approaches, persuasiveness gradient | LLM judge gets full context (session history) for fairness — the variable tested is reasoning susceptibility, not information access |
+| **M5** | Streamlit dashboard: overview, violations, review queue, benchmark results | Human-reviewed FP rate (from review queue) is distinct from benchmark's synthetic FP rate — both tracked separately |
+
+## Key Design Decisions
+
+### Structural Reasoning Isolation
+
+The gate doesn't "ignore" agent reasoning — the `Rule.evaluate()` method signature accepts only `(tool_name, args)`. Reasoning is never passed in, so no rule can access it even if it wanted to. This is enforced at the type level, not by convention.
+
+### session_state vs audit_log
+
+Two separate tables serving different purposes:
+- **audit_log**: Append-only compliance record. Immutable, never pruned. What happened and when.
+- **session_state**: Purpose-built for fast indexed reads by stateful rules. Pruned on a TTL schedule. Gets written on every gate check in the same transaction as audit_log, so they can't diverge.
+
+### Default-ALLOW vs Fail-BLOCK
+
+Two different "allow" decisions with different meanings:
+- **Unknown tool → ALLOW**: No policy configured for this tool. Opt-in design — policies are added incrementally.
+- **OPA unreachable → BLOCK**: Policy engine is down. Cannot verify compliance. Fail closed.
+
+These are deliberately different tradeoffs documented in the code, not accidental inconsistencies.
+
+### Why OPA in Addition to Pydantic
+
+Pydantic rules work but conflate policy logic with application code — every policy change requires a code change and redeploy. OPA/Rego separates policy from code: declarative, versionable independently, testable with OPA's own framework. Both engines remain fully functional and switchable via config, proven equivalent by 25 parity tests.
+
+## How to Run
+
+### Prerequisites
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) package manager
+- Docker (for Postgres + OPA)
+
+### Quick Start
 
 ```bash
-# Start Postgres
-docker-compose up -d
+# Clone and install
+git clone <repo-url> && cd gatekeeper
+uv sync --extra dev
 
-# Install dependencies
-uv sync
+# Start Postgres + OPA
+docker compose up -d
 
-# Run the service
+# Run the gate service
 uv run uvicorn src.gatekeeper.main:app --reload
-```
 
-The service starts at `http://localhost:8000`.
-
-## API Endpoints
-
-### POST /gate/check
-
-Validate a tool call against policy rules.
-
-```bash
-# Clean request — ALLOW
-curl -X POST http://localhost:8000/gate/check \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"s1","tool_name":"send_email","args":{"recipient":"user@gmail.com","body":"Hello"}}'
-
-# PII in args — BLOCK
-curl -X POST http://localhost:8000/gate/check \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"s2","tool_name":"send_email","args":{"recipient":"user@blocked-domain.com","body":"Hello"}}'
-
-# Denylisted domain — BLOCK
-curl -X POST http://localhost:8000/gate/check \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"s3","tool_name":"send_email","args":{"recipient":"admin@blocked-domain.com","body":"Hi"}}'
-```
-
-Response:
-```json
-{
-  "decision": "ALLOW|BLOCK",
-  "matched_rules": [
-    {"rule_id": "pii_detection", "passed": true, "reason": "No PII detected", "severity": "block"}
-  ],
-  "latency_ms": 0.12,
-  "audit_id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-### GET /gate/rules
-
-Return the currently loaded policy configuration.
-
-```bash
-curl http://localhost:8000/gate/rules
-```
-
-### GET /audit/query
-
-Query audit log records with optional filters.
-
-```bash
-# All records
-curl http://localhost:8000/audit/query
-
-# Filter by session
-curl "http://localhost:8000/audit/query?session_id=s1"
-
-# Filter by tool and decision
-curl "http://localhost:8000/audit/query?tool_name=send_email&decision=BLOCK&limit=10"
-```
-
-### GET /health
-
-Liveness check including DB connectivity.
-
-```bash
-curl http://localhost:8000/health
-```
-
-## Design Decisions
-
-### Agent Reasoning Isolation
-
-The `agent_reasoning` field is stored in the audit log but **never evaluated** by the rule engine. This is enforced structurally: the `Rule.evaluate()` method signature accepts only `tool_name` and `args`. The reasoning string is not passed to any rule — it's not ignored, it's inaccessible. This ensures the gate makes decisions purely on what the agent wants to do, not why it claims to want to do it.
-
-### Default Allow for Unknown Tools
-
-When a `tool_name` has no policy defined in `policy_registry.yaml`, the engine returns `ALLOW` with an empty `matched_rules` list. This is a deliberate opt-in design: policies are added incrementally, and tools without rules pass through. This trades off comprehensive coverage for operational simplicity — you can roll out policies gradually without blocking everything by default.
-
-### No Short-Circuit Evaluation
-
-All applicable rules are evaluated for every request, even if an earlier rule already failed. This produces a complete audit trail showing every rule's verdict, which is essential for debugging policy issues and tuning false-positive rates.
-
-### Warn Severity
-
-Rules can have severity `"warn"` or `"block"`. Warn-severity failures are logged but do not cause a BLOCK decision. This enables flagging suspicious-but-allowed behavior for future review without disrupting the workflow.
-
-## Stateful Rules (M2)
-
-GateKeeper extends beyond per-request evaluation with **stateful cross-call constraint checking**. This catches failures that only emerge across a sequence of calls within a session.
-
-### Session State vs Audit Log
-
-| Table | Purpose | Mutability | Query Pattern |
-|-------|---------|------------|---------------|
-| `audit_log` | Append-only compliance record | Write-once | By time range, session, tool |
-| `session_state` | Indexed lookups for stateful rules | TTL-pruned | By `(session_id, tool_name, created_at)` |
-
-The split is deliberate: `audit_log` is the immutable compliance record; `session_state` is a purpose-built index for fast cross-call queries. They're written in the same transaction so they can't diverge, but they serve different needs.
-
-### Built-in Stateful Rules
-
-**RateLimitRule** — blocks if more than N calls to a tool occur within a time window per session. Configured per-tool in `policy_registry.yaml`:
-```yaml
-rate_limit:
-  max_calls: 3
-  window_seconds: 300
-```
-
-**ScopeCreepRule** — the core failure mode this project exists to catch. Blocks if a tool call references an entity that was explicitly marked as protected in an earlier call within the same session. The agent's reasoning for why it should be allowed is never evaluated — only the protection tag matters.
-
-### Protection Tagging
-
-Tools can "tag" entities as protected via the `tag_tools` config:
-```yaml
-check_permissions:
-  tag_tools:
-    protected_field: "record_id"
-    protected_tag: "protected_record_ids"
-```
-
-When `check_permissions(record_id=X)` is ALLOW'd, the engine automatically writes a session_state record with `tags: {"protected_record_ids": ["X"]}`. ScopeCreepRule then blocks any subsequent call referencing X.
-
-### Session State Pruning
-
-Session state records are automatically pruned. Run manually or via cron:
-```bash
-# Prune records older than 24h (default)
-uv run python scripts/prune_session_state.py
-
-# Custom TTL
-SESSION_STATE_TTL_HOURS=12 uv run python scripts/prune_session_state.py
-```
-
-## Agent Demo
-
-The `agent_demo/` module demonstrates GateKeeper with a LangGraph agent. It requires optional dependencies:
-```bash
-uv sync --extra agent
-```
-
-### Scope Creep Demo
-
-Run the standalone scope-creep demonstration:
-```bash
-# Start the service first
-docker-compose up -d
-uv run uvicorn src.gatekeeper.main:app
-
-# In another terminal, run the demo with Pydantic engine (default)
+# Run the scope-creep demo (requires the gate service running)
 uv run python -m agent_demo.scenarios.scope_creep_demo
 
-# Or run with OPA engine (requires OPA sidecar)
+# Run with OPA engine
 uv run python -m agent_demo.scenarios.scope_creep_demo --engine opa
 ```
 
-This reproduces the exact failure mode:
-1. Agent calls `check_permissions(record_id=X)` → ALLOW (X tagged as protected)
-2. Agent calls `delete_record(record_id=X)` with reasoning "deletion is a special case" → BLOCKED
-
-The output clearly shows the before/after with and without GateKeeper.
-
-## Rule Engines (M3)
-
-GateKeeper supports two swappable rule engine backends via the `ENGINE_BACKEND` environment variable:
-
-| Engine | Default | Description |
-|--------|---------|-------------|
-| `pydantic` | Yes | Python-native rules using Pydantic validation. Good for development and single-developer projects. |
-| `opa` | No | OPA/Rego sidecar. Declarative policies, versionable independently, testable with OPA's own framework. Industry standard for multi-team policy management. |
-
-### Why OPA?
-
-Pydantic rules conflate policy logic with application code — every policy change requires a code change and redeploy. OPA/Rego separates policy from code:
-
-- **Declarative**: Policies are data, not code. Easier to review, audit, and reason about.
-- **Independent versioning**: Policy files can be versioned and deployed separately from the service.
-- **Built-in testing**: OPA has its own test framework (`opa test`) for policy-level validation.
-- **Industry standard**: Used by Netflix, Pinterest, Chef, and others for exactly this use case.
-
-### Switching Engines
+### Running the Benchmark
 
 ```bash
-# Use Pydantic engine (default)
-ENGINE_BACKEND=pydantic uv run uvicorn src.gatekeeper.main:app
+# Set your Groq API key
+export GROQ_API_KEY=gsk_...
 
-# Use OPA engine (requires OPA sidecar)
-docker-compose up -d opa
-ENGINE_BACKEND=opa uv run uvicorn src.gatekeeper.main:app
+# Run the full benchmark (50 scenarios, costs Groq API calls)
+uv run python -m benchmark
+
+# Regenerate report from cached results (no API calls)
+uv run python -m benchmark --report-only
 ```
 
-### OPA Architecture
-
-```
-FastAPI Gate Service
-    │
-    ├─ RuleEngine interface (strategy pattern)
-    │    ├─ PydanticRuleEngine   (M1/M2, unchanged)
-    │    └─ OPARuleEngine        (queries OPA over HTTP)
-    │
-    └─ ENGINE_BACKEND env var selects implementation
-
-OPA Server (Docker sidecar)
-    │  POST /v1/data/gatekeeper/decision
-    │  Input: { tool_name, args, session_history }
-    │  Output: { decision, matched_rules }
-    └  Policies loaded from ./policies/rego/
-```
-
-Session history is fetched in Python and passed to OPA as input — OPA does not talk to Postgres directly.
-
-### Fail-BLOCK on OPA Unreachable
-
-If the OPA server is unreachable, `OPARuleEngine` returns **BLOCK**. This is an infrastructure failure, distinct from the M1 default-ALLOW for unknown tools:
-
-- **Unknown tool → ALLOW**: Policy is opt-in. No rule configured means no restriction.
-- **OPA unreachable → BLOCK**: Policy engine is down. Cannot verify compliance. Fail closed.
-
-This distinction is deliberate: an unreachable policy engine is a system failure that must be detected and resolved, not silently bypassed.
-
-### Rego Policies
-
-Policies live in `policies/rego/`:
-
-```
-policies/rego/
-├── data.json                  # Policy config (bounds, denylists, rate limits)
-├── decision.rego              # Top-level decision combiner
-├── pii_detection.rego         # PII regex matching
-├── argument_bounds.rego       # Type/pattern/range validation
-├── denylist.rego              # Value denylist checks
-├── rate_limit.rego            # Cross-call rate limiting
-├── scope_creep.rego           # Protected entity tracking
-└── *_test.rego                # OPA-native tests
-```
-
-Run OPA tests:
-```bash
-docker-compose up -d opa
-docker compose exec opa opa test /policies -v
-```
-
-### Parity Testing
-
-The parity test suite (`tests/test_parity.py`) runs the same test cases against both engines and asserts identical decisions:
+### Running the Dashboard
 
 ```bash
-# Pydantic parity tests (always run)
-uv run pytest tests/test_parity.py::TestParity -v
+# Install dashboard dependencies
+pip install -r dashboard/requirements-dashboard.txt
 
-# OPA parity tests (require OPA server)
-docker-compose up -d opa
-uv run pytest tests/test_parity.py::TestOPAParity -v
+# Launch
+uv run streamlit run dashboard/app.py
 ```
 
-Both engines are proven equivalent on the full test suite, including the scope-creep scenario. Any behavioral mismatch is surfaced as a test failure, not hidden.
+## Tech Stack
 
-## Testing
+| Layer | Technology |
+|-------|-----------|
+| Language | Python 3.11+ |
+| Package Manager | uv |
+| Web Framework | FastAPI |
+| Validation | Pydantic v2 |
+| ORM | SQLAlchemy 2.0 async |
+| Database | PostgreSQL (asyncpg) |
+| Policy Engine | OPA/Rego |
+| Agent Demo | LangGraph + Groq (llama-3.3-70b) |
+| Dashboard | Streamlit |
+| Testing | pytest + OPA native test framework |
+| Infrastructure | Docker Compose |
+
+## Test Coverage
+
+**151 tests, all passing.**
 
 ```bash
+# Python tests (120)
 uv run pytest -v
+
+# OPA/Rego tests (31)
+opa test -b policies/rego/
 ```
 
-Key test categories:
-- **Rule isolation tests**: each built-in rule tested independently (stateless + stateful)
-- **Engine integration tests**: multiple rules on one tool, mixed severities, stateful flow
-- **API integration tests**: full request → response → audit log verification
-- **Scope creep integration test**: check_permissions → delete_record → BLOCK via API
-- **Rate limit integration test**: N calls within window → BLOCK on N+1
-- **Transactional consistency**: both tables written per check, matching row counts
-- **Adversarial test**: identical args with different agent_reasoning produces identical decisions
-- **Latency tests**: stateless <50ms, stateful <100ms
-- **Parity tests**: both engines produce identical decisions on shared test cases
-- **OPA tests**: Rego policies validated with OPA's built-in test framework
+Test categories:
+- Rule isolation tests (each rule independently)
+- Engine integration tests (mixed rules, stateful flow)
+- API integration tests (full request → audit log)
+- Parity tests (Pydantic vs OPA produce identical decisions)
+- Benchmark data layer tests
+- Transactional consistency tests
+- Adversarial tests (reasoning independence)
+
+## Limitations
+
+This is a demonstration system validated against a self-designed 50-scenario benchmark, not battle-tested against production traffic or adaptive real-world adversaries. The benchmark scenarios were authored by the same person who built the system, which introduces selection bias — the scenarios test the failure modes I knew to look for.
+
+The rule set (5 families: PII detection, argument bounds, denylist, rate limit, scope creep) is illustrative, not exhaustive. Real production policies would need additional rules for credential handling, data exfiltration patterns, resource consumption, and cross-service authorization — none of which are implemented here.
+
+The LLM judge benchmark uses a single model (llama-3.3-70b via Groq) with a fixed prompt. Different models or prompt strategies might perform differently. The benchmark measures one specific failure mode (reasoning-based bypass) under controlled conditions, not general LLM judgment capability.
+
+## What I'd Do Next
+
+- **Expand the rule taxonomy**: Add credential handling, data exfiltration detection, and resource consumption rules to cover more real-world policy categories.
+- **Adaptive red-teaming**: Replace static scenarios with an adversarial agent that iteratively refines its bypass strategy based on gate responses, testing against evolving rather than fixed justifications.
+- **Multi-step chained violations**: Detect sequences where individual calls are each compliant but their combination violates policy (e.g., exfiltrating data across multiple API calls that each look benign in isolation).
