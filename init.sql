@@ -19,3 +19,14 @@ CREATE INDEX IF NOT EXISTS ix_session_state_session_id ON session_state (session
 CREATE INDEX IF NOT EXISTS ix_session_state_tool_name ON session_state (tool_name);
 CREATE INDEX IF NOT EXISTS ix_session_state_created_at ON session_state (created_at);
 CREATE INDEX IF NOT EXISTS ix_session_state_lookup ON session_state (session_id, tool_name, created_at);
+
+-- human_reviews table for dashboard false-positive review tracking
+CREATE TABLE IF NOT EXISTS human_reviews (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    audit_id UUID NOT NULL,
+    reviewer_note TEXT,
+    marked_fp BOOLEAN DEFAULT FALSE,
+    reviewed_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ix_human_reviews_audit_id ON human_reviews (audit_id);
