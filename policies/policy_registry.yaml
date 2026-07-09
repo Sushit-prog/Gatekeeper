@@ -1,0 +1,29 @@
+tools:
+  send_email:
+    rules: [pii_detection, denylist]
+    pii_exclude_fields: ["recipient"]
+    denylist:
+      field: "recipient"
+      values: ["blocked-domain.com", "spam-domain.org"]
+
+  http_post:
+    rules: [pii_detection, argument_bounds, denylist]
+    argument_bounds:
+      timeout: {type: int, min: 1, max: 300}
+      body: {type: str, max_length: 10000}
+    denylist:
+      field: "url"
+      values: ["internal.corp", "localhost"]
+
+  delete_record:
+    rules: [argument_bounds]
+    argument_bounds:
+      record_id: {type: str, pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+
+  file_write:
+    rules: [denylist, argument_bounds]
+    denylist:
+      field: "path"
+      values: ["/etc/passwd", "/etc/shadow", "/root/"]
+    argument_bounds:
+      path: {type: str, pattern: "^[a-zA-Z0-9/_.-]+$"}
